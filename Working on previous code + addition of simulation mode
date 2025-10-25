@@ -1,0 +1,356 @@
+
+"""
+PPG + EEG Real-Time Display (v2)
+--------------------------------
+- Reads one pair "PPG,EEG" per serial line (same effective sample rate for both)
+- Band-pass filters (zero-phase), 50/60 Hz notch on EEG
+- PPG peak detection + heart-rate estimation
+- Live plotting (2 subplots) with visible peaks & auto y-limits
+- CSV logging with periodic flush
+- Simulate mode for testing without Arduino
+- CLI args for convenience (see `python app.py -h`)
+- CODE HAS A SIMULATION FEATURE
+
+Dependencies:
+    pip install numpy matplotlib scipy pyserial
+"""
+
+import argparse
+import time
+from datetime import datetime
+from collections import deque
+import sys
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from scipy import signal
+
+try:
+    import serial  # pyserial
+except Exception:
+    serial = None  # handled in simulate mode
+
+# ------------------------------
+# Defaults (overridable via CLI)
+# ------------------------------
+DEF_PORT = "COM3"              # Windows example; macOS/Linux: /dev/ttyUSB0 or /dev/ttyACM0
+DEF_BAUD = 115200
+DEF_FS   = 100                 # Hz — true line rate if one "PPG,EEG" pair per line
+DEF_WINDOW = 10                # seconds of history on screen
+DEF_UPDATE_MS = 100            # UI refresh interval (ms)
+DEF_NOTCH = 50.0               # Hz (50 in SG/EU; use 60 in US/JP)
+DEF_LOGFILE = f"data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+DEF_SIM = False
+
+# ------------------------------
+# Filter design
+# ------------------------------
+def design_filters(ppg_fs: float, eeg_fs: float, notch_hz: float):
+    """Return (ppg_sos, eeg_sos, notch_ba) for zero-phase filtering."""
+    # PPG: 0.5–15 Hz
+    ppg_nyq = 0.5 * ppg_fs
+    ppg_low = 0.5 / ppg_nyq
+    ppg_high = 15.0 / ppg_nyq
+    ppg_sos = signal.butter(4, [ppg_low, ppg_high], btype="band", output="sos")
+
+    # EEG: 0.5–50 Hz band
+    eeg_nyq = 0.5 * eeg_fs
+    eeg_low = 0.5 / eeg_nyq
+    eeg_high = 50.0 / eeg_nyq
+    eeg_sos = signal.butter(4, [eeg_low, eeg_high], btype="band", output="sos")
+
+    # Notch at mains (use fs= API to avoid normalization mistakes)
+    notch_b, notch_a = signal.iirnotch(w0=notch_hz, Q=30, fs=eeg_fs)
+    return ppg_sos, eeg_sos, (notch_b, notch_a)
+
+def filter_ppg(x: np.ndarray, sos) -> np.ndarray:
+    x = np.asarray(x)
+    if x.size < 20:
+        return x
+    return signal.sosfiltfilt(sos, x)
+
+def filter_eeg(x: np.ndarray, sos, notch_ba) -> np.ndarray:
+    x = np.asarray(x)
+    if x.size < 20:
+        return x
+    x = signal.sosfiltfilt(sos, x)
+    b, a = notch_ba
+    return signal.filtfilt(b, a, x)
+
+# ------------------------------
+# Peaks + heart rate
+# ------------------------------
+def detect_peaks(ppg_filt: np.ndarray, fs: float) -> np.ndarray:
+    """Robust-ish peaks: mean+0.5*std threshold, min distance ~0.30 s (≈200 BPM), with prominence."""
+    x = np.asarray(ppg_filt)
+    if x.size < 10:
+        return np.array([], dtype=int)
+    thr = x.mean() + 0.5 * x.std()
+    min_dist = max(1, int(0.30 * fs))  # allow up to ~200 BPM
+    prom = 0.2 * x.std()
+    peaks, _ = signal.find_peaks(x, height=thr, distance=min_dist, prominence=prom)
+    return peaks
+
+def heart_rate_from_peaks(peaks: np.ndarray, fs: float) -> float:
+    if peaks.size < 2:
+        return 0.0
+    rr = np.diff(peaks) / fs
+    if rr.size == 0 or rr.mean() == 0:
+        return 0.0
+    bpm = 60.0 / rr.mean()
+    return bpm if 40.0 < bpm < 200.0 else 0.0
+
+# ------------------------------
+# Data source
+# ------------------------------
+class DataSource:
+    """Wrap serial or simulated generator."""
+    def __init__(self, port: str, baud: int, simulate: bool, fs: float):
+        self.simulate = simulate
+        self.fs = fs
+        self.start_time = time.time()
+        self._last_sim_t = self.start_time
+
+        if self.simulate:
+            print("✓ Simulate mode (no Arduino required).")
+            self.ser = None
+        else:
+            if serial is None:
+                raise RuntimeError("pyserial not installed. Use --simulate or install pyserial.")
+            try:
+                self.ser = serial.Serial(port, baud, timeout=1)
+                time.sleep(2)  # allow Arduino reset
+                print(f"✓ Connected to Arduino on {port} @ {baud} bps")
+            except Exception as e:
+                print(f"✗ Error: Could not connect to {port} @ {baud}\n{e}")
+                self.ser = None
+
+    def read_pair(self):
+        """Return (ppg, eeg) floats or (None, None) if no fresh data."""
+        if self.simulate:
+            # Generate one pair roughly every 1/fs seconds
+            now = time.time()
+            dt = now - self._last_sim_t
+            if dt < 1.0 / max(self.fs, 1):
+                return (None, None)
+            t = now - self.start_time
+            self._last_sim_t = now
+            # Synthetic signals
+            ppg = 0.8 * np.sin(2*np.pi*1.2*t) + 0.05*np.random.randn()
+            eeg = 30*np.sin(2*np.pi*10*t) + 5*np.random.randn() + 10*np.sin(2*np.pi*50*t)
+            return (float(ppg), float(eeg))
+
+        # Serial mode
+        if self.ser is None:
+            return (None, None)
+        try:
+            if self.ser.in_waiting:
+                raw = self.ser.readline().decode(errors="ignore").strip()
+                parts = raw.split(",")
+                if len(parts) != 2:
+                    return (None, None)
+                ppg = float(parts[0])
+                eeg = float(parts[1])
+                return (ppg, eeg)
+        except Exception:
+            return (None, None)
+        return (None, None)
+
+    def close(self):
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+
+# ------------------------------
+# Real-time display
+# ------------------------------
+class RealTimeDisplay:
+    def __init__(self, src: DataSource, fs: float, window_s: int, update_ms: int,
+                 notch_hz: float, logfile: str):
+        self.src = src
+        self.fs = fs
+        self.window_s = window_s
+        self.update_ms = update_ms
+        self.notch_hz = notch_hz
+
+        self.ppg_sos, self.eeg_sos, self.notch_ba = design_filters(fs, fs, notch_hz)
+
+        # Buffers (rolling)
+        maxlen = int(max(3_000, fs * (window_s + 2)))  # small cushion
+        self.t0 = time.time()
+        self.t_buf = deque(maxlen=maxlen)
+        self.ppg_raw = deque(maxlen=maxlen)
+        self.eeg_raw = deque(maxlen=maxlen)
+        self.ppg_filt = deque(maxlen=maxlen)
+        self.eeg_filt = deque(maxlen=maxlen)
+        self.peaks_idx = np.array([], dtype=int)
+        self.hr_bpm = 0.0
+
+        # Logging
+        self.logfile = logfile
+        self._log = open(self.logfile, "w", buffering=1)
+        self._log.write("Time,PPG_Raw,PPG_Filtered,EEG_Raw,EEG_Filtered,HeartRate\n")
+        self._rows_since_flush = 0
+
+        # Figure
+        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(12, 8), constrained_layout=True)
+        self._setup_plot()
+
+        # Keep animation object referenced
+        self.ani = FuncAnimation(self.fig, self._update, interval=self.update_ms)
+
+    def _setup_plot(self):
+        # PPG axis
+        self.ax1.set_title("PPG")
+        self.ax1.set_ylabel("Amplitude")
+        (self.line_ppg,) = self.ax1.plot([], [], lw=1.5)
+        (self.peaks_plot,) = self.ax1.plot([], [], "r*", ms=9)
+        self.hr_text = self.ax1.text(0.02, 0.95, "", transform=self.ax1.transAxes, va="top")
+
+        # EEG axis
+        self.ax2.set_title("EEG")
+        self.ax2.set_ylabel("µV")
+        self.ax2.set_xlabel("Time (s)")
+        (self.line_eeg,) = self.ax2.plot([], [], lw=1.2)
+
+    def _append_and_filter(self, ppg, eeg):
+        t = time.time() - self.t0
+        self.t_buf.append(t)
+        self.ppg_raw.append(ppg)
+        self.eeg_raw.append(eeg)
+
+        # Filter full buffer for simplicity (ok for short windows)
+        ppg_f = filter_ppg(np.asarray(self.ppg_raw), self.ppg_sos)
+        eeg_f = filter_eeg(np.asarray(self.eeg_raw), self.eeg_sos, self.notch_ba)
+        # Replace deques with latest arrays (bounded by maxlen)
+        self.ppg_filt = deque(ppg_f, maxlen=self.ppg_filt.maxlen)
+        self.eeg_filt = deque(eeg_f, maxlen=self.eeg_filt.maxlen)
+
+        # Peaks + HR
+        self.peaks_idx = detect_peaks(np.asarray(self.ppg_filt), self.fs)
+        self.hr_bpm = heart_rate_from_peaks(self.peaks_idx, self.fs)
+
+        # Log last values
+        last_ppg_f = float(self.ppg_filt[-1]) if self.ppg_filt else 0.0
+        last_eeg_f = float(self.eeg_filt[-1]) if self.eeg_filt else 0.0
+        self._log.write(f"{t:.3f},{ppg},{last_ppg_f},{eeg},{last_eeg_f},{self.hr_bpm:.1f}\n")
+        self._rows_since_flush += 1
+        if self._rows_since_flush >= 25:  # flush every ~0.25s at 100 Hz
+            try:
+                self._log.flush()
+            except Exception:
+                pass
+            self._rows_since_flush = 0
+
+    def _update(self, _frame):
+        ppg, eeg = self.src.read_pair()
+        if ppg is not None and eeg is not None:
+            self._append_and_filter(ppg, eeg)
+
+        if len(self.t_buf) == 0:
+            return self.line_ppg, self.peaks_plot, self.line_eeg
+
+        # Plot last window
+        t = np.asarray(self.t_buf)
+        tmax = t[-1]
+        tmin = max(0.0, tmax - self.window_s)
+        # Get indices within window
+        mask = t >= tmin
+        t_win = t[mask]
+
+        # PPG
+        y_ppg = np.asarray(self.ppg_filt)[-t_win.size:] if len(self.ppg_filt) >= t_win.size else np.asarray(self.ppg_filt)
+        self.line_ppg.set_data(t_win, y_ppg)
+        # Peaks within window
+        if self.peaks_idx.size > 0:
+            # peaks indices refer to full-length buffer; align to window
+            # Build a full-length index vector corresponding to filt buffer
+            idx_offset = len(self.ppg_filt) - len(t)
+            peaks_adj = self.peaks_idx - max(0, idx_offset)
+            valid = (peaks_adj >= 0) & (peaks_adj < t.size)
+            peaks_in_view = peaks_adj[valid]
+            in_window = peaks_in_view[mask[peaks_in_view]] if peaks_in_view.size else np.array([], dtype=int)
+            self.peaks_plot.set_data(t[in_window], np.asarray(self.ppg_filt)[in_window] if in_window.size else [])
+        else:
+            self.peaks_plot.set_data([], [])
+
+        # EEG
+        y_eeg = np.asarray(self.eeg_filt)[-t_win.size:] if len(self.eeg_filt) >= t_win.size else np.asarray(self.eeg_filt)
+        self.line_eeg.set_data(t_win, y_eeg)
+
+        # X-limits
+        self.ax1.set_xlim(tmin, tmax)
+        self.ax2.set_xlim(tmin, tmax)
+
+        # Y-limits (stable)
+        if y_ppg.size > 10 and np.ptp(y_ppg) > 0:
+            pad = 0.1 * np.ptp(y_ppg)
+            self.ax1.set_ylim(y_ppg.min() - pad, y_ppg.max() + pad)
+        if y_eeg.size > 10 and np.ptp(y_eeg) > 0:
+            pad2 = 0.1 * np.ptp(y_eeg)
+            self.ax2.set_ylim(y_eeg.min() - pad2, y_eeg.max() + pad2)
+
+        # HR text
+        self.hr_text.set_text(f"Heart Rate: {self.hr_bpm:.1f} BPM")
+
+        return self.line_ppg, self.peaks_plot, self.line_eeg
+
+    def run(self):
+        print("Starting real-time plot...")
+        try:
+            plt.show()
+        finally:
+            # Always close resources
+            try:
+                self._log.close()
+            except Exception:
+                pass
+            try:
+                self.src.close()
+            except Exception:
+                pass
+            print(f"Log saved to: {self.logfile}")
+
+# ------------------------------
+# CLI and main
+# ------------------------------
+def parse_args():
+    ap = argparse.ArgumentParser(description="Real-time PPG/EEG viewer with HR from PPG.")
+    ap.add_argument("--port", "-p", default=DEF_PORT, help="Serial port (e.g., COM3 or /dev/ttyUSB0)")
+    ap.add_argument("--baud", "-b", type=int, default=DEF_BAUD, help="Baud rate")
+    ap.add_argument("--fs", type=float, default=DEF_FS, help="Line/sample rate (Hz) for both PPG & EEG")
+    ap.add_argument("--window", "-w", type=int, default=DEF_WINDOW, help="Display window (seconds)")
+    ap.add_argument("--update", "-u", type=int, default=DEF_UPDATE_MS, help="UI update interval (ms)")
+    ap.add_argument("--notch", type=float, default=DEF_NOTCH, help="Mains notch frequency (50 or 60 Hz)")
+    ap.add_argument("--log", default=DEF_LOGFILE, help="CSV logfile path")
+    ap.add_argument("--simulate", action="store_true", default=DEF_SIM, help="Run without Arduino (synthetic data)")
+    return ap.parse_args()
+
+def main():
+    args = parse_args()
+
+    # Safety: if not sim and pyserial missing → bail with hint
+    if not args.simulate and serial is None:
+        print("pyserial not available. Install with `pip install pyserial` or use --simulate")
+        sys.exit(1)
+
+    # Data source
+    src = DataSource(port=args.port, baud=args.baud, simulate=args.simulate, fs=args.fs)
+    if not args.simulate and src.ser is None:
+        print("Connection failed. Check cable/port or run with --simulate.")
+        sys.exit(1)
+
+    app = RealTimeDisplay(
+        src=src,
+        fs=args.fs,
+        window_s=args.window,
+        update_ms=args.update,
+        notch_hz=args.notch,
+        logfile=args.log,
+    )
+    app.run()
+
+if __name__ == "__main__":
+    main()
