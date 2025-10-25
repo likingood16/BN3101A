@@ -1,0 +1,35 @@
+// Analog PPG on A0, print "<PPG>,0" at 100 Hz
+// Compatible with your Python v2 script (expects "PPG,EEG")
+
+const uint8_t PPG_PIN = A0;
+const uint32_t SAMPLE_HZ = 100;                  // Target sample rate
+const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_HZ;
+
+unsigned long nextSampleUs;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { /* wait for native USB boards */ }
+
+  // Optional: stabilize ADC reference if needed
+  analogReference(DEFAULT); // On Uno/Nano; adjust if you use EXTERNAL or INTERNAL refs
+
+  // Preload first timestamp
+  nextSampleUs = micros();
+}
+
+void loop() {
+  unsigned long now = micros();
+  if ((long)(now - nextSampleUs) >= 0) {
+    // Read raw ADC (10-bit on Uno: 0..1023). Keep it raw; Python will filter.
+    int raw = analogRead(PPG_PIN);
+
+    // Print as "<PPG>,0\n" to match Python's expected two-column CSV.
+    Serial.print(raw);
+    Serial.print(',');
+    Serial.println(0);
+
+    // Schedule next sample; use += to reduce jitter drift
+    nextSampleUs += SAMPLE_PERIOD_US;
+  }
+}
