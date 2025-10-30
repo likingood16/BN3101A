@@ -1,0 +1,101 @@
+import numpy as np
+import pandas as pd
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+np.random.seed(42)
+n_samples = 5000
+sampling_rate = 250  # Hz
+time = np.arange(n_samples) / sampling_rate
+
+# ============================================================================
+# SIGNAL GENERATION HELPERS
+# ============================================================================
+def generate_ppg_irregular(time, base_hr=70/60, noise_amp=0.1, irregular=False):
+    """Generate PPG signal; irregular version adds HR modulation and spikes."""
+    hr = base_hr
+    ppg = np.sin(2 * np.pi * hr * time) + 0.3 * np.sin(2 * np.pi * 2 * hr * time)
+    ppg += noise_amp * np.random.randn(len(time))
+
+    if irregular:
+        # Heart rate fluctuates slowly
+        hr_variation = 0.2 * np.sin(2 * np.pi * 0.05 * time)
+        ppg = np.sin(2 * np.pi * (hr + hr_variation) * time)
+        ppg += 0.3 * np.sin(2 * np.pi * 2 * (hr + hr_variation) * time)
+        ppg += noise_amp * np.random.randn(len(time))
+
+        # Add random spikes to simulate motion artifacts
+        spike_indices = np.random.choice(len(time), size=30, replace=False)
+        ppg[spike_indices] += np.random.uniform(2, 4, size=len(spike_indices)) * np.random.choice([-1, 1], len(spike_indices))
+
+    return ppg
+
+
+def generate_eeg_irregular(time, noise_amp=0.15, irregular=False):
+    """Generate EEG signal; irregular version includes bursts and transient oscillations."""
+    alpha = 0.5 * np.sin(2 * np.pi * 10 * time)
+    beta  = 0.3 * np.sin(2 * np.pi * 20 * time)
+    theta = 0.2 * np.sin(2 * np.pi * 6  * time)
+    eeg = alpha + beta + theta + noise_amp * np.random.randn(len(time))
+
+    if irregular:
+        for _ in range(15):
+            burst_start = np.random.randint(0, len(time) - 200)
+            burst_end = burst_start + np.random.randint(50, 200)
+            burst_len = burst_end - burst_start
+
+            # Create local burst time segment matching the burst length
+            t_segment = np.linspace(0, burst_len / sampling_rate, burst_len, endpoint=False)
+
+            # Add burst of high-frequency oscillations
+            eeg[burst_start:burst_end] += np.sin(2 * np.pi * 30 * t_segment) * np.random.uniform(1, 2)
+
+        # Add slow amplitude modulation (like attention or drowsiness)
+        modulation = 1 + 0.5 * np.sin(2 * np.pi * 0.1 * time)
+        eeg *= modulation
+
+    return eeg
+
+
+def add_annotations(n_samples):
+    """Add annotations for key experimental events."""
+    annotations = [''] * n_samples
+    annotations[100] = 'baseline_start'
+    annotations[1000] = 'stimulus_1'
+    annotations[2500] = 'stimulus_2'
+    annotations[4000] = 'baseline_end'
+    return annotations
+
+# ============================================================================
+# GENERATE 4 DATASETS
+# ============================================================================
+datasets = {
+    "1_normal_ppg_eeg":              (generate_ppg_irregular(time, irregular=False),
+                                      generate_eeg_irregular(time, irregular=False)),
+
+    "2_irregular_ppg_eeg":           (generate_ppg_irregular(time, irregular=True),
+                                      generate_eeg_irregular(time, irregular=True)),
+
+    "3_irregular_ppg_regular_eeg":   (generate_ppg_irregular(time, irregular=True),
+                                      generate_eeg_irregular(time, irregular=False)),
+
+    "4_regular_ppg_irregular_eeg":   (generate_ppg_irregular(time, irregular=False),
+                                      generate_eeg_irregular(time, irregular=True))
+}
+
+# ============================================================================
+# SAVE CSV FILES
+# ============================================================================
+for name, (ppg, eeg) in datasets.items():
+    df = pd.DataFrame({
+        "time": time,
+        "ppg": ppg,
+        "eeg": eeg,
+        "annotations": add_annotations(len(time))
+    })
+    filename = f"{name}.csv"
+    df.to_csv(filename, index=False)
+    print(f"✅ Saved {filename} ({len(time)} samples)")
+
+print("\nAll four datasets created successfully!")
