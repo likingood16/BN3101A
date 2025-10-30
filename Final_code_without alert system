@@ -1,0 +1,267 @@
+import sys
+import numpy as np
+import pandas as pd
+from scipy import signal
+from collections import deque
+from PyQt5 import QtWidgets, QtCore
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal
+import pyqtgraph as pg
+
+# ============================================================================
+# CONFIGURATION CONSTANTS
+# ============================================================================
+BUFFER_SIZE = 5000       # samples stored in memory
+SAMPLING_RATE = 250      # Hz
+UPDATE_INTERVAL = 50     # ms (GUI refresh rate)
+CHUNK_SIZE = 25          # samples per update
+WINDOW_DURATION = 20     # seconds visible on screen  <<< EXTENDED HERE
+
+# ============================================================================
+# THREADS
+# ============================================================================
+class DataAcquisitionThread(QThread):
+    new_data = pyqtSignal(np.ndarray, np.ndarray)
+    def __init__(self, sr=SAMPLING_RATE):
+        super().__init__()
+        self.sr = sr
+        self.running = False
+        self.t = 0
+    def run(self):
+        self.running = True
+        while self.running:
+            t_chunk = np.linspace(self.t, self.t + CHUNK_SIZE/self.sr, CHUNK_SIZE)
+            ppg = np.sin(2*np.pi*(70/60)*t_chunk) + 0.3*np.sin(2*np.pi*(140/60)*t_chunk)
+            ppg += 0.1*np.random.randn(CHUNK_SIZE)
+            eeg = 0.5*np.sin(2*np.pi*10*t_chunk) + 0.3*np.sin(2*np.pi*20*t_chunk)
+            eeg += 0.2*np.random.randn(CHUNK_SIZE)
+            self.t += CHUNK_SIZE/self.sr
+            self.new_data.emit(ppg, eeg)
+            self.msleep(int(1000*CHUNK_SIZE/self.sr))
+    def stop(self):
+        self.running = False
+        self.wait()
+
+class CSVPlaybackThread(QThread):
+    """Loops CSV playback continuously until stopped."""
+    new_data = pyqtSignal(np.ndarray, np.ndarray)
+    def __init__(self, ppg, eeg, sr=SAMPLING_RATE, chunk=CHUNK_SIZE):
+        super().__init__()
+        self.ppg = ppg; self.eeg = eeg
+        self.sr = sr; self.chunk = chunk
+        self.running = False
+    def run(self):
+        self.running = True
+        n = len(self.ppg)
+        idx = 0
+        while self.running:
+            end = idx + self.chunk
+            if end >= n:
+                idx = 0
+                end = self.chunk
+            self.new_data.emit(self.ppg[idx:end], self.eeg[idx:end])
+            idx = end
+            self.msleep(int(1000*self.chunk/self.sr))
+    def stop(self):
+        self.running = False
+        self.wait()
+
+# ============================================================================
+# SIGNAL PROCESSOR
+# ============================================================================
+class SignalProcessor:
+    def __init__(self, sr=SAMPLING_RATE):
+        self.sr = sr
+    def compute_psd(self, data, nperseg=256):
+        nperseg = min(nperseg, len(data))
+        f, p = signal.welch(data, fs=self.sr, nperseg=nperseg)
+        return f, p
+    def compute_spectrogram(self, data, nperseg=128, noverlap=None):
+        noverlap = nperseg//2 if noverlap is None else noverlap
+        nperseg = min(nperseg, len(data))
+        f, t, Sxx = signal.spectrogram(data, fs=self.sr, nperseg=nperseg, noverlap=noverlap)
+        return f, t, 10*np.log10(Sxx+1e-10)
+
+# ============================================================================
+# MAIN GUI
+# ============================================================================
+class DualSignalVisualizationGUI(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PPG & EEG Dual Signal Visualization")
+        self.setGeometry(100, 100, 1400, 900)
+        self.processor = SignalProcessor()
+        self.view_mode = 'waveform'
+        self.ppg_buf, self.eeg_buf, self.time_buf = (deque(maxlen=BUFFER_SIZE) for _ in range(3))
+        self.acq_thread = None
+        self.play_thread = None
+        self.realtime = False
+        self.csv_loaded = False
+        self.setup_ui()
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_plots)
+        self.timer.start(UPDATE_INTERVAL)
+
+    # ---------------- UI SETUP ----------------
+    def setup_ui(self):
+        cw = QtWidgets.QWidget(); self.setCentralWidget(cw)
+        layout = QtWidgets.QVBoxLayout(cw)
+        layout.addLayout(self.control_panel())
+        self.graphs = pg.GraphicsLayoutWidget(); self.graphs.setBackground('w')
+        layout.addWidget(self.graphs)
+        self.waveform_plots()
+        self.spectrum_plots()
+        self.spectrogram_plots()
+        self.set_view_mode('waveform')
+        self.statusBar().showMessage("Ready")
+
+    def control_panel(self):
+        l = QtWidgets.QHBoxLayout()
+        # View group
+        vg = QtWidgets.QGroupBox("View Mode")
+        vl = QtWidgets.QHBoxLayout()
+        for name in ["Waveform","Spectrum","Spectrogram"]:
+            b = QtWidgets.QPushButton(name)
+            b.clicked.connect(lambda _, m=name.lower(): self.set_view_mode(m))
+            vl.addWidget(b)
+        vg.setLayout(vl); l.addWidget(vg)
+        # Source group
+        sg = QtWidgets.QGroupBox("Data Source")
+        sl = QtWidgets.QHBoxLayout()
+        self.load_btn = QtWidgets.QPushButton("Load CSV")
+        self.start_btn = QtWidgets.QPushButton("Start Playback / Real-Time")
+        self.stop_btn = QtWidgets.QPushButton("Stop"); self.stop_btn.setEnabled(False)
+        self.load_btn.clicked.connect(self.load_csv)
+        self.start_btn.clicked.connect(self.start_data)
+        self.stop_btn.clicked.connect(self.stop_all)
+        for b in (self.load_btn, self.start_btn, self.stop_btn): sl.addWidget(b)
+        sg.setLayout(sl); l.addWidget(sg)
+        l.addStretch(); return l
+
+    # ---------------- PLOTS ----------------
+    def waveform_plots(self):
+        self.ppg_plot = self.graphs.addPlot(row=0,col=0)
+        self.ppg_plot.setTitle("PPG Signal", color='b')
+        self.ppg_plot.setLabel('left','PPG (V)'); self.ppg_plot.setLabel('bottom','Time (s)')
+        self.ppg_curve = self.ppg_plot.plot(pen=pg.mkPen('b', width=2))
+        self.graphs.nextRow()
+        self.eeg_plot = self.graphs.addPlot(row=1,col=0)
+        self.eeg_plot.setTitle("EEG Signal", color='r')
+        self.eeg_plot.setLabel('left','EEG (V)'); self.eeg_plot.setLabel('bottom','Time (s)')
+        self.eeg_curve = self.eeg_plot.plot(pen=pg.mkPen('r', width=2))
+        self.eeg_plot.setXLink(self.ppg_plot)
+    def spectrum_plots(self):
+        self.ppg_spec = self.graphs.addPlot(row=2,col=0); self.ppg_spec_curve=self.ppg_spec.plot(pen='b')
+        self.eeg_spec = self.graphs.addPlot(row=2,col=1); self.eeg_spec_curve=self.eeg_spec.plot(pen='r')
+        self.ppg_spec.hide(); self.eeg_spec.hide()
+    def spectrogram_plots(self):
+        self.ppg_specg=self.graphs.addPlot(row=3,col=0); self.ppg_img=pg.ImageItem(); self.ppg_specg.addItem(self.ppg_img)
+        self.eeg_specg=self.graphs.addPlot(row=4,col=0); self.eeg_img=pg.ImageItem(); self.eeg_specg.addItem(self.eeg_img)
+        self.ppg_specg.hide(); self.eeg_specg.hide()
+
+    # ---------------- VIEW ----------------
+    def set_view_mode(self, m):
+        self.view_mode=m
+        for p in [self.ppg_plot,self.eeg_plot,self.ppg_spec,self.eeg_spec,self.ppg_specg,self.eeg_specg]:
+            p.hide()
+        if m=='waveform':
+            self.ppg_plot.show(); self.eeg_plot.show()
+        elif m=='spectrum':
+            self.ppg_spec.show(); self.eeg_spec.show()
+        else:
+            self.ppg_specg.show(); self.eeg_specg.show()
+
+    # ---------------- DATA ----------------
+    def load_csv(self):
+        path,_=QtWidgets.QFileDialog.getOpenFileName(self,'Open CSV','','CSV Files (*.csv)')
+        if not path: return
+        df=pd.read_csv(path)
+        if 'ppg' not in df or 'eeg' not in df:
+            QtWidgets.QMessageBox.warning(self,'Missing Columns','CSV must have ppg and eeg columns')
+            return
+        self.ppg_data=df['ppg'].values; self.eeg_data=df['eeg'].values
+        self.csv_loaded=True
+        self.statusBar().showMessage(f"CSV loaded: {len(df)} samples. Press 'Start Playback' to begin.")
+
+    def start_data(self):
+        self.stop_all()
+        self.ppg_buf.clear(); self.eeg_buf.clear(); self.time_buf.clear()
+        if self.csv_loaded:
+            self.play_thread=CSVPlaybackThread(self.ppg_data,self.eeg_data)
+            self.play_thread.new_data.connect(self.add_data)
+            self.play_thread.start()
+            self.statusBar().showMessage("CSV playback started (looping).")
+        else:
+            self.acq_thread=DataAcquisitionThread()
+            self.acq_thread.new_data.connect(self.add_data)
+            self.acq_thread.start()
+            self.statusBar().showMessage("Real-time acquisition started.")
+        self.stop_btn.setEnabled(True)
+
+    def stop_all(self):
+        if self.acq_thread:
+            self.acq_thread.stop(); self.acq_thread=None
+        if self.play_thread:
+            self.play_thread.stop(); self.play_thread=None
+        self.stop_btn.setEnabled(False)
+        self.statusBar().showMessage("Stopped all data streams.")
+
+    # ---------------- BUFFER ----------------
+    def add_data(self,ppg,eeg):
+        base_t=len(self.time_buf)/SAMPLING_RATE
+        for i,(p,e) in enumerate(zip(ppg,eeg)):
+            t=base_t+i/SAMPLING_RATE
+            self.ppg_buf.append(p); self.eeg_buf.append(e); self.time_buf.append(t)
+
+    # ---------------- UPDATE ----------------
+    def update_plots(self):
+        if len(self.time_buf)<2: return
+        t=np.array(self.time_buf)
+        ppg=np.array(self.ppg_buf)
+        eeg=np.array(self.eeg_buf)
+        if self.view_mode == 'waveform':
+    # Only show the latest WINDOW_DURATION worth of data
+            samples_to_show = int(WINDOW_DURATION * SAMPLING_RATE)
+            ppg_seg = ppg[-samples_to_show:]
+            eeg_seg = eeg[-samples_to_show:]
+        # Generate a relative time vector (e.g. 0–10 s)
+            t_seg = np.linspace(0, len(ppg_seg) / SAMPLING_RATE, len(ppg_seg))
+            self.ppg_curve.setData(t_seg, ppg_seg)
+            self.eeg_curve.setData(t_seg, eeg_seg)
+            self.ppg_plot.setXRange(0, WINDOW_DURATION)
+            self.eeg_plot.setXRange(0, WINDOW_DURATION)
+        elif self.view_mode == 'spectrum':
+            # Use only the most recent window of data for "live" spectrum
+            samples_to_show = int(WINDOW_DURATION * SAMPLING_RATE)
+            ppg_seg = ppg[-samples_to_show:]
+            eeg_seg = eeg[-samples_to_show:]
+
+            freqs_ppg, psd_ppg = self.processor.compute_psd(ppg_seg)
+            freqs_eeg, psd_eeg = self.processor.compute_psd(eeg_seg)
+
+            # Update the correct spectrum plot objects
+            self.ppg_spec_curve.setData(freqs_ppg, 10*np.log10(psd_ppg + 1e-10))
+            self.eeg_spec_curve.setData(freqs_eeg, 10*np.log10(psd_eeg + 1e-10))
+
+            # Keep axis stable for a clean look
+            self.ppg_spec.setXRange(0, 10)
+            self.eeg_spec.setXRange(0, 50)
+
+        else:
+            f1,tt1,S1=self.processor.compute_spectrogram(ppg)
+            self.ppg_img.setImage(S1.T,autoLevels=True)
+            f2,tt2,S2=self.processor.compute_spectrogram(eeg)
+            self.eeg_img.setImage(S2.T,autoLevels=True)
+
+    def closeEvent(self,e):
+        self.stop_all(); e.accept()
+
+# ============================================================================
+def main():
+    app=QtWidgets.QApplication(sys.argv)
+    app.setStyle('Fusion')
+    w=DualSignalVisualizationGUI()
+    w.show()
+    sys.exit(app.exec_())
+
+if __name__=='__main__':
+    main()
