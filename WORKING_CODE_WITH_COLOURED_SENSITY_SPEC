@@ -1,0 +1,712 @@
+import sys
+import numpy as np
+import pandas as pd
+from scipy import signal
+from collections import deque
+from PyQt5 import QtWidgets, QtCore
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal
+import pyqtgraph as pg
+
+# ============================================================================
+# CONFIGURATION CONSTANTS
+# ============================================================================
+BUFFER_SIZE     = 5000
+SAMPLING_RATE   = 250      # Hz
+UPDATE_INTERVAL = 50       # ms
+CHUNK_SIZE      = 25
+WINDOW_DURATION = 20       # seconds visible on screen
+
+# ------------------ TUNING (edit here) ------------------
+# PPG beat-based irregularity detector (morphology gates)
+PPG_BAND_LO         = 0.7
+PPG_BAND_HI         = 6.0
+PPG_MIN_HR          = 35.0     # bpm
+PPG_MAX_HR          = 180.0    # bpm
+PPG_PEAK_PROM       = 0.28
+PPG_Z_THR           = 3.7
+PPG_DEV_FRAC        = 0.6
+PPG_REQUIRE_BOTH    = True     # amp AND slope anomalies required
+PPG_MIN_BEAT_AMP    = 0.35
+PPG_RMSE_ENABLE     = True
+PPG_RMSE_THR        = 0.42
+PPG_WORST_PCT       = 0.20
+PPG_FLAG_REFRACT    = 0.35
+PPG_PAD_T           = 0.08
+PPG_PAD_A_FRAC      = 0.08
+
+# RR-interval (period) change detector
+PPG_RR_Z_THR        = 3.0
+PPG_RR_DEV_FRAC     = 0.25
+PPG_RR_MIN_BEATS    = 1
+PPG_RR_REFRACT      = 0.35
+PPG_RR_MIN_WIDTH_S  = 0.20
+
+# NEW — Regular-signal suppression & minimum-evidence gates
+PPG_CALIBRATION_SECS      = 5.0     # suppress PPG alerts in the first N seconds
+PPG_REGULAR_RR_STD_FRAC   = 0.10    # std(RR) < 10% of median RR → very regular
+PPG_REGULAR_RMSE_P80      = 0.35    # 80th percentile of beat RMSE < 0.35 → very regular morphology
+PPG_MIN_FLAGGED_BEATS     = 3       # need at least 3 flagged beats in the window
+PPG_MIN_FLAGGED_FRAC      = 0.15    # and ≥ 15% of beats flagged
+
+# EEG burst detectors
+RMS_WIN        = 0.200
+RMS_STEP       = 0.040
+RMS_Z          = 3.0
+RMS_MIN_DUR    = 0.20
+RMS_MAX_DUR    = 3.00
+RMS_REFACT     = 0.30
+BAND_ENABLE    = True
+BAND_LO        = 8.0
+BAND_HI        = 30.0
+BP_WIN         = 0.250
+BP_STEP        = 0.050
+BP_Z           = 3.0
+BP_MIN_DUR     = 0.20
+BP_MAX_DUR     = 3.00
+BP_REFACT      = 0.30
+
+ELLIPSE_PEN    = pg.mkPen(0, 0, 0, width=2)  # solid black
+
+# Spectrogram display levels (dB) – tweak if you like
+SPEC_DB_LOW    = -80
+SPEC_DB_HIGH   = -10
+
+# ============================================================================
+# COLOR MAP (REDDISH)
+# ============================================================================
+def make_blue_lut(n=256):
+    """
+    Dark navy -> deep blue -> blue -> teal -> cyan -> near-white
+    """
+    colors = [
+        (0,   0,   0),    # black
+        (0,   10,  40),   # very dark navy
+        (0,   30,  120),  # deep blue
+        (0,   70,  200),  # blue
+        (0,   130, 200),  # blue-teal
+        (0,   180, 220),  # teal-cyan
+        (180, 240, 255),  # pale cyan
+        (255, 255, 255),  # white
+    ]
+    pos = np.linspace(0.0, 1.0, len(colors))
+    cmap = pg.ColorMap(pos, np.array(colors, dtype=np.ubyte))
+    return cmap.getLookupTable(0.0, 1.0, n)
+
+# ============================================================================
+# THREADS
+# ============================================================================
+class DataAcquisitionThread(QThread):
+    new_data = pyqtSignal(np.ndarray, np.ndarray)
+    def __init__(self, sr=SAMPLING_RATE):
+        super().__init__()
+        self.sr = sr
+        self.running = False
+        self.t = 0.0
+    def run(self):
+        self.running = True
+        try:
+            while self.running:
+                t_chunk = np.linspace(self.t, self.t + CHUNK_SIZE/self.sr, CHUNK_SIZE, endpoint=False)
+                # synthetic PPG (beats + occasional artifacts)
+                ppg = np.sin(2*np.pi*(70/60)*t_chunk) + 0.3*np.sin(2*np.pi*(140/60)*t_chunk)
+                ppg += 0.1*np.random.randn(CHUNK_SIZE)
+                if np.random.rand() < 0.02:
+                    k = np.random.randint(0, CHUNK_SIZE)
+                    ppg[k] += np.random.choice([1, -1]) * np.random.uniform(2, 4)
+                # synthetic EEG (alpha/beta + occasional burst blocks)
+                eeg = 0.5*np.sin(2*np.pi*10*t_chunk) + 0.3*np.sin(2*np.pi*20*t_chunk) + 0.2*np.random.randn(CHUNK_SIZE)
+                if np.random.rand() < 0.015:
+                    eeg += np.sin(2*np.pi*30*t_chunk) * np.random.uniform(1.5, 2.5)
+                self.t += CHUNK_SIZE/self.sr
+                self.new_data.emit(ppg, eeg)
+                self.msleep(int(1000*CHUNK_SIZE/self.sr))
+        except Exception as e:
+            print("DataAcquisitionThread crashed:", repr(e))
+            self.running = False
+    def stop(self): self.running = False; self.wait()
+
+class CSVPlaybackThread(QThread):
+    new_data = pyqtSignal(np.ndarray, np.ndarray)
+    def __init__(self, ppg, eeg, sr=SAMPLING_RATE, chunk=CHUNK_SIZE):
+        super().__init__()
+        self.ppg = ppg; self.eeg = eeg
+        self.sr = sr; self.chunk = chunk
+        self.running = False
+    def run(self):
+        self.running = True
+        try:
+            n = len(self.ppg); idx = 0
+            while self.running:
+                end = idx + self.chunk
+                if end >= n: idx = 0; end = self.chunk
+                self.new_data.emit(self.ppg[idx:end], self.eeg[idx:end])
+                idx = end
+                self.msleep(int(1000*self.chunk/self.sr))
+        except Exception as e:
+            print("CSVPlaybackThread crashed:", repr(e))
+            self.running = False
+    def stop(self): self.running = False; self.wait()
+
+# ============================================================================
+# SIGNAL PROCESSOR
+# ============================================================================
+class SignalProcessor:
+    def __init__(self, sr=SAMPLING_RATE): self.sr = sr
+    def compute_spectrogram(self, data, nperseg=128, noverlap=None):
+        noverlap = nperseg//2 if noverlap is None else noverlap
+        nperseg  = max(32, min(nperseg, len(data)))
+        f, t, Sxx = signal.spectrogram(data, fs=self.sr, nperseg=nperseg, noverlap=noverlap)
+        return f, t, 10*np.log10(Sxx + 1e-10)
+
+# ============================================================================
+# MAIN GUI
+# ============================================================================
+class DualSignalVisualizationGUI(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PPG & EEG Dual Signal Visualization")
+        self.setGeometry(100, 100, 1400, 900)
+        self.processor = SignalProcessor()
+        self.view_mode = 'waveform'
+        self.ppg_buf, self.eeg_buf, self.time_buf = (deque(maxlen=BUFFER_SIZE) for _ in range(3))
+        self.acq_thread = None
+        self.play_thread = None
+        self.csv_loaded = False
+
+        # last alert booleans (so spectrogram can show badges)
+        self.ppg_alert_active = False
+        self.eeg_alert_active = False
+
+        self.ppg_ellipses = []
+        self.eeg_ellipses = []
+
+        # Reddish LUT for spectrograms
+        self.spec_lut = make_blue_lut()
+
+        self.setup_ui()
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_plots)
+        self.timer.start(UPDATE_INTERVAL)
+
+    # ---------------- UI SETUP ----------------
+    def setup_ui(self):
+        cw = QtWidgets.QWidget(); self.setCentralWidget(cw)
+        layout = QtWidgets.QVBoxLayout(cw)
+        layout.addLayout(self.control_panel())
+        self.graphs = pg.GraphicsLayoutWidget(); self.graphs.setBackground('w')
+        layout.addWidget(self.graphs)
+        self.waveform_plots()
+        self.spectrogram_plots()
+        self.set_view_mode('waveform')
+        self.statusBar().showMessage("Ready")
+
+        # ---- Alert badges (TextItem) on each plot, anchored top-right ----
+        self.ppg_wave_badge = pg.TextItem(anchor=(1,0)); self.ppg_wave_badge.setZValue(1e6)
+        self.eeg_wave_badge = pg.TextItem(anchor=(1,0)); self.eeg_wave_badge.setZValue(1e6)
+        self.ppg_plot.addItem(self.ppg_wave_badge)
+        self.eeg_plot.addItem(self.eeg_wave_badge)
+
+        self.ppg_spec_badge = pg.TextItem(anchor=(1,0)); self.ppg_spec_badge.setZValue(1e6)
+        self.eeg_spec_badge = pg.TextItem(anchor=(1,0)); self.eeg_spec_badge.setZValue(1e6)
+        self.ppg_specg.addItem(self.ppg_spec_badge)
+        self.eeg_specg.addItem(self.eeg_spec_badge)
+
+    def control_panel(self):
+        l = QtWidgets.QHBoxLayout()
+        vg = QtWidgets.QGroupBox("View Mode")
+        vl = QtWidgets.QHBoxLayout()
+        self.wave_btn = QtWidgets.QPushButton("Waveform")
+        self.specgram_btn = QtWidgets.QPushButton("Spectrogram")
+        self.wave_btn.clicked.connect(lambda: self.set_view_mode('waveform'))
+        self.specgram_btn.clicked.connect(lambda: self.set_view_mode('spectrogram'))
+        vl.addWidget(self.wave_btn); vl.addWidget(self.specgram_btn)
+        vg.setLayout(vl); l.addWidget(vg)
+
+        sg = QtWidgets.QGroupBox("Data Source")
+        sl = QtWidgets.QHBoxLayout()
+        self.load_btn = QtWidgets.QPushButton("Load CSV")
+        self.start_btn = QtWidgets.QPushButton("Start Playback / Real-Time")
+        self.stop_btn = QtWidgets.QPushButton("Stop"); self.stop_btn.setEnabled(False)
+        self.load_btn.clicked.connect(self.load_csv)
+        self.start_btn.clicked.connect(self.start_data)
+        self.stop_btn.clicked.connect(self.stop_all)
+        for b in (self.load_btn, self.start_btn, self.stop_btn): sl.addWidget(b)
+        sg.setLayout(sl); l.addWidget(sg)
+
+        l.addStretch()
+        return l
+
+    # ---------------- Axis look & feel ----------------
+    def _apply_axis_style(self, plot, y_label="Amplitude (V)"):
+        plot.setLabel('left', y_label)
+        plot.setLabel('bottom', 'Time (s)')
+        bottom = plot.getAxis('bottom'); left = plot.getAxis('left')
+        try:
+            bottom.setTickSpacing(major=2, minor=0.5)
+            left.setTickSpacing(major=1, minor=0.5)
+            bottom.enableAutoSIPrefix(False); left.enableAutoSIPrefix(False)
+        except Exception:
+            pass
+        plot.getViewBox().setDefaultPadding(0.02)
+
+    # ---------------- PLOTS ----------------
+    def waveform_plots(self):
+        # PPG
+        self.ppg_plot = self.graphs.addPlot(row=0, col=0)
+        self.ppg_plot.setTitle("PPG Signal", color='b')
+        self.ppg_curve = self.ppg_plot.plot(pen=pg.mkPen('b', width=1))
+        self._apply_axis_style(self.ppg_plot, y_label='PPG (V)')
+
+        # EEG
+        self.graphs.nextRow()
+        self.eeg_plot = self.graphs.addPlot(row=1, col=0)
+        self.eeg_plot.setTitle("EEG Signal", color='r')
+        self.eeg_curve = self.eeg_plot.plot(pen=pg.mkPen('r', width=1))
+        self._apply_axis_style(self.eeg_plot, y_label='EEG (V)')
+        self.eeg_plot.setXLink(self.ppg_plot)
+
+    def spectrogram_plots(self):
+        self.ppg_specg = self.graphs.addPlot(row=2, col=0)
+        self.ppg_img = pg.ImageItem()
+        self.ppg_img.setLookupTable(self.spec_lut)   # apply reddish LUT
+        self.ppg_img.setAutoDownsample(True)
+        self.ppg_specg.addItem(self.ppg_img)
+        self.ppg_specg.setLabel('left', 'Freq (Hz)')
+        self.ppg_specg.setLabel('bottom', 'Time (s)')
+        self.ppg_specg.hide()
+
+        self.graphs.nextRow()
+        self.eeg_specg = self.graphs.addPlot(row=3, col=0)
+        self.eeg_img = pg.ImageItem()
+        self.eeg_img.setLookupTable(self.spec_lut)   # apply reddish LUT
+        self.eeg_img.setAutoDownsample(True)
+        self.eeg_specg.addItem(self.eeg_img)
+        self.eeg_specg.setLabel('left', 'Freq (Hz)')
+        self.eeg_specg.setLabel('bottom', 'Time (s)')
+        self.eeg_specg.hide()
+
+    # ---------------- VIEW ----------------
+    def set_view_mode(self, m):
+        self.view_mode = m
+        for p in [self.ppg_plot, self.eeg_plot, self.ppg_specg, self.eeg_specg]:
+            p.hide()
+        if m == 'waveform':
+            self.ppg_plot.show(); self.eeg_plot.show()
+        elif m == 'spectrogram':
+            self.ppg_specg.show(); self.eeg_specg.show()
+
+    # ---------------- DATA LOAD / START / STOP ----------------
+    def load_csv(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Open CSV', '', 'CSV Files (*.csv)')
+        if not path: return
+        df = pd.read_csv(path)
+        if 'ppg' not in df or 'eeg' not in df:
+            QtWidgets.QMessageBox.warning(self, 'Missing Columns', 'CSV must have ppg and eeg columns')
+            return
+        self.ppg_data = df['ppg'].values
+        self.eeg_data = df['eeg'].values
+        self.csv_loaded = True
+        self.statusBar().showMessage(f"CSV loaded: {len(df)} samples. Press 'Start Playback' to begin.")
+
+    def start_data(self):
+        self.stop_all()
+        self.ppg_buf.clear(); self.eeg_buf.clear(); self.time_buf.clear()
+        try:
+            if self.csv_loaded:
+                self.play_thread = CSVPlaybackThread(self.ppg_data, self.eeg_data, SAMPLING_RATE, CHUNK_SIZE)
+                self.play_thread.new_data.connect(self.add_data)
+                self.play_thread.start()
+                self.statusBar().showMessage("CSV playback started (looping).")
+            else:
+                self.acq_thread = DataAcquisitionThread(SAMPLING_RATE)
+                self.acq_thread.new_data.connect(self.add_data)
+                self.acq_thread.start()
+                self.statusBar().showMessage("Real-time acquisition started.")
+            self.stop_btn.setEnabled(True)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Start error", str(e))
+
+    def stop_all(self):
+        if self.acq_thread:
+            try: self.acq_thread.stop()
+            finally: self.acq_thread = None
+        if self.play_thread:
+            try: self.play_thread.stop()
+            finally: self.play_thread = None
+        self.stop_btn.setEnabled(False)
+        self.statusBar().showMessage("Stopped all data streams.")
+
+    # ---------------- BUFFER APPEND ----------------
+    def add_data(self, ppg_chunk: np.ndarray, eeg_chunk: np.ndarray):
+        base_t = len(self.time_buf) / SAMPLING_RATE
+        for i, (p, e) in enumerate(zip(ppg_chunk, eeg_chunk)):
+            t = base_t + i / SAMPLING_RATE
+            self.time_buf.append(t)
+            self.ppg_buf.append(p)
+            self.eeg_buf.append(e)
+
+    # ---------------- UTILITIES ----------------
+    @staticmethod
+    def _robust_z(x):
+        med = np.median(x)
+        mad = np.median(np.abs(x - med)) + 1e-9
+        return (x - med) / (1.4826 * mad)
+
+    @staticmethod
+    def _frame_rms(x, sr, win_s, step_s):
+        win = max(1, int(round(win_s * sr)))
+        step = max(1, int(round(step_s * sr)))
+        if len(x) < win: return np.array([]), np.array([])
+        feats, times = [], []
+        for start in range(0, len(x) - win + 1, step):
+            seg = x[start:start + win]
+            feats.append(np.sqrt(np.mean(seg ** 2)))
+            times.append((start + win / 2) / sr)
+        return np.array(times), np.array(feats)
+
+    @staticmethod
+    def _merge_spans(spans, max_gap):
+        if not spans: return []
+        spans.sort(key=lambda s: s[0])
+        merged = [list(spans[0])]
+        for s in spans[1:]:
+            prev = merged[-1]
+            if s[0] - prev[1] <= max_gap:
+                prev[1] = max(prev[1], s[1])
+                prev[2] = min(prev[2], s[2])
+                prev[3] = max(prev[3], s[3])
+            else:
+                merged.append(list(s))
+        return merged
+
+    def _keep_worst_percent(self, scores, pct):
+        scores = np.asarray(scores)
+        if scores.size == 0 or pct <= 0: return np.zeros(0, dtype=bool)
+        k = max(1, int(np.ceil(scores.size * pct)))
+        thr = np.partition(scores, -k)[-k]
+        return scores >= thr
+
+    def _set_robust_y_range(self, plot, data, pad_frac=0.18):
+        if len(data) < 5: return
+        lo, hi = np.percentile(data, [1, 99])
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo: return
+        pad = (hi - lo) * pad_frac + 1e-9
+        plot.setYRange(lo - pad, hi + pad, padding=0.0)
+
+    # -------- PPG TEMPLATE RMSE --------
+    def _beat_template_rmse(self, yb, beats, sr):
+        L = 100
+        mats = []
+        for b in beats:
+            tl, tr = b["tl"], b["tr"]
+            seg = yb[tl:tr+1]
+            if len(seg) < 10: mats.append(None); continue
+            xp = np.linspace(0, 1, len(seg))
+            xq = np.linspace(0, 1, L)
+            yq = np.interp(xq, xp, seg)
+            mats.append(yq)
+        arr = np.array([m for m in mats if m is not None])
+        if arr.size == 0: return [1.0]*len(beats)
+        template = np.median(arr, axis=0)
+        rmse_vals = []
+        for m in mats:
+            if m is None: rmse_vals.append(1.0)
+            else:
+                denom = np.std(template) + 1e-9
+                rmse_vals.append(float(np.sqrt(np.mean((m - template)**2)) / denom))
+        return rmse_vals
+
+    # ---------------- PPG BEAT DETECTOR (STRICT + RR + regularity suppression) ----------------
+    def detect_ppg_irregular_beats(self, y, sr):
+        n = len(y)
+        if n < int(0.8 * sr): return []
+
+        # Band-limit
+        nyq = sr / 2
+        lo = max(0.1, PPG_BAND_LO / nyq); hi = min(0.999, PPG_BAND_HI / nyq)
+        if hi <= lo: yb = y.copy()
+        else:
+            b, a = signal.butter(3, [lo, hi], btype='band')
+            yb = signal.filtfilt(b, a, y) if n > 3*max(len(b), len(a)) else y.copy()
+
+        # Peaks
+        min_dist = int(sr * 60.0 / PPG_MAX_HR)
+        distance = max(1, min_dist)
+        peaks, _ = signal.find_peaks(yb, distance=distance, prominence=PPG_PEAK_PROM, width=int(0.05*sr))
+        if len(peaks) < 3: return []
+
+        # Troughs
+        troughs, _ = signal.find_peaks(-yb, distance=distance//2)
+        troughs = np.array(troughs)
+        def lt(idx): t = troughs[troughs < idx]; return t[-1] if len(t) else max(0, idx - distance)
+        def rt(idx): t = troughs[troughs > idx]; return t[0] if len(t) else min(n - 1, idx + distance)
+
+        # Features per beat
+        beats=[]
+        for pk in peaks:
+            tl = lt(pk); tr = rt(pk)
+            if tr - tl < int(0.08 * sr): continue
+            seg_f = yb[tl:tr+1]; seg_r = y[tl:tr+1]
+            peak_amp = yb[pk]; trough_amp = min(yb[tl], yb[tr])
+            amp = peak_amp - trough_amp
+            rr  = (tr - tl) / sr
+            dseg = np.diff(seg_f)*sr; slope_max = np.max(np.abs(dseg)) if len(dseg) else 0.0
+            beats.append({"tl":tl,"tr":tr,"pk":pk,
+                          "amp":amp,"rr":rr,"slope":slope_max,
+                          "ymin":float(seg_r.min()),"ymax":float(seg_r.max())})
+        if len(beats) < 3: return []
+
+        amps = np.array([b["amp"]   for b in beats])
+        rrs  = np.array([b["rr"]    for b in beats])
+        sls  = np.array([b["slope"] for b in beats])
+
+        def rob(v):
+            med = np.median(v); mad = np.median(np.abs(v-med))+1e-9
+            z = (v - med)/(1.4826*mad)
+            return med, z
+
+        amp_med, amp_z = rob(amps)
+        rr_med,  rr_z  = rob(rrs)
+        sl_med,  sl_z  = rob(sls)
+
+        # Template RMSE & worst-percent
+        rmse_vals = np.asarray(self._beat_template_rmse(yb, beats, sr)) if PPG_RMSE_ENABLE else np.zeros(len(beats))
+        keep_mask_pct = self._keep_worst_percent(rmse_vals, PPG_WORST_PCT) if (PPG_RMSE_ENABLE and PPG_WORST_PCT>0) \
+                        else np.ones(len(beats), dtype=bool)
+
+        # ---------------- Regular-signal suppression ----------------
+        # (1) calibration: suppress early section
+        window_mid_time = (self.time_buf[-1] if len(self.time_buf) else 0.0)
+        if window_mid_time < PPG_CALIBRATION_SECS:
+            return []
+
+        # (2) if beats are very regular morphologically AND RR variability small, suppress
+        rr_std_ok = np.std(rrs) <= PPG_REGULAR_RR_STD_FRAC * (np.abs(rr_med) + 1e-9)
+        rmse_p80  = np.percentile(rmse_vals, 80) if len(rmse_vals) else 1.0
+        morph_ok  = rmse_p80 <= PPG_REGULAR_RMSE_P80
+        if rr_std_ok and morph_ok:
+            return []
+
+        spans=[]
+
+        # (A) Morphology-based flags
+        morph_flags = np.zeros(len(beats), dtype=bool)
+        for idx,(b,zA,zR,zS) in enumerate(zip(beats, amp_z, rr_z, sl_z)):
+            if b["amp"] < PPG_MIN_BEAT_AMP: 
+                continue
+            dev_amp = abs(b["amp"]-amp_med)/(abs(amp_med)+1e-9)
+            dev_sl  = abs(b["slope"]-sl_med)/(abs(sl_med)+1e-9)
+            amp_out   = (abs(zA) >= PPG_Z_THR) or (dev_amp >= PPG_DEV_FRAC)
+            slope_out = (abs(zS) >= PPG_Z_THR) or (dev_sl  >= PPG_DEV_FRAC)
+            core_bad  = (amp_out and slope_out) if PPG_REQUIRE_BOTH else (amp_out or slope_out)
+            morph_bad = (not PPG_RMSE_ENABLE) or (rmse_vals[idx] >= PPG_RMSE_THR)
+            morph_bad = morph_bad and keep_mask_pct[idx]
+            morph_flags[idx] = core_bad and morph_bad
+            if morph_flags[idx]:
+                ts = max(0.0, (b["tl"]/sr) - PPG_PAD_T)
+                te = min(n/sr, (b["tr"]/sr) + PPG_PAD_T)
+                if te>ts: spans.append([ts,te,b["ymin"],b["ymax"]])
+
+        # (B) RR-interval (period) change flags
+        rr_dev_rel = np.abs(rrs - rr_med) / (np.abs(rr_med) + 1e-9)
+        rr_out = (np.abs(rr_z) >= PPG_RR_Z_THR) | (rr_dev_rel >= PPG_RR_DEV_FRAC)
+
+        i = 0; m = len(beats)
+        rr_flag_count = 0
+        while i < m:
+            if rr_out[i]:
+                j = i + 1
+                while j < m and rr_out[j]: j += 1
+                run_len = j - i
+                if run_len >= PPG_RR_MIN_BEATS:
+                    tl = beats[i]["tl"]; tr = beats[j-1]["tr"]
+                    ts = max(0.0, (tl / sr) - PPG_PAD_T)
+                    te = min(n/sr, (tr / sr) + PPG_PAD_T)
+                    if te - ts >= PPG_RR_MIN_WIDTH_S:
+                        y0 = float(np.min([b["ymin"] for b in beats[i:j]]))
+                        y1 = float(np.max([b["ymax"] for b in beats[i:j]]))
+                        spans.append([ts, te, y0, y1])
+                        rr_flag_count += run_len
+                i = j
+            else:
+                i += 1
+
+        # ---------------- Minimum-evidence gate ----------------
+        total_beats = len(beats)
+        approx_flagged_beats = int(morph_flags.sum()) + rr_flag_count
+        if approx_flagged_beats < PPG_MIN_FLAGGED_BEATS or \
+           approx_flagged_beats < int(np.ceil(PPG_MIN_FLAGGED_FRAC * total_beats)):
+            return []
+
+        # merge + refractory (combine A & B)
+        spans = self._merge_spans(spans, max_gap=0.05)
+        filtered, last_end = [], -1e-9
+        for s in spans:
+            if s[0] - last_end >= max(PPG_FLAG_REFRACT, PPG_RR_REFRACT):
+                filtered.append(s); last_end = s[1]
+        return filtered
+
+    # ---------------- EEG DETECTORS (bursts) ----------------
+    def _frame_bursts(self, y, sr, win, step, zthr, min_dur, max_dur, refr):
+        t, rms = self._frame_rms(y, sr, win, step)
+        if len(rms) == 0: return []
+        z = self._robust_z(rms); mask = z >= zthr
+        spans=[]; i=0; n=len(mask)
+        while i<n:
+            if mask[i]:
+                j=i+1
+                while j<n and mask[j]: j+=1
+                t0=t[i]-win/2; t1=t[j-1]+win/2
+                dur=t1-t0
+                if min_dur<=dur<=max_dur:
+                    i0=max(0,int(t0*sr)); i1=min(len(y),int(t1*sr))
+                    seg=y[i0:i1]
+                    spans.append([max(0.0,t0), min(len(y)/sr,t1), float(seg.min()), float(seg.max())])
+                i=j
+            else: i+=1
+        spans=self._merge_spans(spans, max_gap=step)
+        out=[]; last=-1e9
+        for s in spans:
+            if s[0]-last>=refr: out.append(s); last=s[1]
+        return out
+
+    def detect_rms_bursts(self, y, sr): return self._frame_bursts(y, sr, RMS_WIN, RMS_STEP, RMS_Z, RMS_MIN_DUR, RMS_MAX_DUR, RMS_REFACT)
+    def detect_bandpower_bursts(self, y, sr):
+        if not BAND_ENABLE: return []
+        nyq = sr/2; lo = max(0.1, BAND_LO/nyq); hi = min(0.999, BAND_HI/nyq)
+        if hi<=lo: return []
+        b,a = signal.butter(4,[lo,hi],btype='band')
+        yb  = signal.filtfilt(b,a,y) if len(y)>3*max(len(b),len(a)) else y.copy()
+        return self._frame_bursts(yb, sr, BP_WIN, BP_STEP, BP_Z, BP_MIN_DUR, BP_MAX_DUR, BP_REFACT)
+
+    def detect_irregular_spans_eeg(self, y, sr):
+        spans = self.detect_rms_bursts(y, sr)
+        spans += self.detect_bandpower_bursts(y, sr)
+        return self._merge_spans(spans, max_gap=0.04)
+
+    # ---------------- BADGE HELPERS ----------------
+    def _badge_html(self, active: bool) -> str:
+        bg = 'rgba(220,0,0,0.9)' if active else 'rgba(0,160,0,0.9)'
+        text = 'ALERT' if active else 'OK'
+        return (f"<div style='color:white;background:{bg};"
+                f"padding:2px 6px;border:1px solid black;"
+                f"border-radius:4px;font-weight:600;'>{text}</div>")
+
+    def _place_badge_top_right(self, plot: pg.PlotItem, badge: pg.TextItem, x_margin=0.2, y_frac_from_top=0.03):
+        xr, yr = plot.viewRange()
+        width  = xr[1] - xr[0]
+        height = yr[1] - yr[0]
+        x = xr[1] - x_margin                 # small right margin in seconds
+        y = yr[1] - y_frac_from_top*height   # e.g., 3% below the top
+        badge.setPos(x, y)
+
+    # ---------------- UPDATE ----------------
+    def update_plots(self):
+        if len(self.time_buf) < 2: return
+        ppg = np.array(self.ppg_buf); eeg = np.array(self.eeg_buf)
+
+        if self.view_mode == 'waveform':
+            samples_to_show = int(WINDOW_DURATION * SAMPLING_RATE)
+            ppg_seg = ppg[-samples_to_show:]; eeg_seg = eeg[-samples_to_show:]
+            t_seg = np.arange(len(ppg_seg)) / SAMPLING_RATE
+
+            self.ppg_curve.setData(t_seg, ppg_seg)
+            self.eeg_curve.setData(t_seg, eeg_seg)
+            self.ppg_plot.setXRange(0, WINDOW_DURATION)
+            self.eeg_plot.setXRange(0, WINDOW_DURATION)
+
+            # robust Y ranges with headroom
+            self._set_robust_y_range(self.ppg_plot, ppg_seg, pad_frac=0.9)
+            self._set_robust_y_range(self.eeg_plot,  eeg_seg,  pad_frac=0.7)
+
+            # clear old ellipses
+            for item in self.ppg_ellipses:
+                try: self.ppg_plot.removeItem(item)
+                except Exception: pass
+            for item in self.eeg_ellipses:
+                try: self.eeg_plot.removeItem(item)
+                except Exception: pass
+            self.ppg_ellipses.clear(); self.eeg_ellipses.clear()
+
+            # detect spans and draw
+            ppg_spans = self.detect_ppg_irregular_beats(ppg_seg, SAMPLING_RATE)
+            eeg_spans = self.detect_irregular_spans_eeg(eeg_seg, SAMPLING_RATE)
+
+            self.ppg_alert_active = len(ppg_spans) > 0
+            self.eeg_alert_active = len(eeg_spans) > 0
+
+            def add_ellipses(ax_plot, spans, seg, store):
+                if len(seg)==0: return
+                amp_pad = PPG_PAD_A_FRAC * (np.max(seg) - np.min(seg) + 1e-9)
+                for (ts, te, y0, y1) in spans:
+                    x = max(0.0, ts - PPG_PAD_T)
+                    w = min(WINDOW_DURATION, te + PPG_PAD_T) - x
+                    if w<=0: continue
+                    y = min(y0,y1) - amp_pad
+                    h = abs(y1-y0) + 2*amp_pad
+                    if h<=0: continue
+                    try:
+                        ell = pg.EllipseROI(pos=(x,y), size=(w,h), movable=False, rotatable=False, resizable=False)
+                    except TypeError:
+                        ell = pg.EllipseROI((x,y),(w,h))
+                        try:
+                            ell.setMovable(False); ell.setRotatable(False); ell.setResizable(False)
+                        except Exception: pass
+                    ell.setZValue(100)
+                    try: ell.setPen(ELLIPSE_PEN)
+                    except Exception: pass
+                    try: ell.setBrush(pg.mkBrush(0,0,0,0))
+                    except Exception: pass
+                    try:
+                        for hnd in getattr(ell,'handles',[]): hnd['item'].setVisible(False)
+                    except Exception: pass
+                    ax_plot.addItem(ell); store.append(ell)
+
+            add_ellipses(self.ppg_plot, ppg_spans, ppg_seg, self.ppg_ellipses)
+            add_ellipses(self.eeg_plot, eeg_spans, eeg_seg, self.eeg_ellipses)
+
+            # update waveform badges (top-right)
+            self.ppg_wave_badge.setHtml(self._badge_html(self.ppg_alert_active))
+            self.eeg_wave_badge.setHtml(self._badge_html(self.eeg_alert_active))
+            self._place_badge_top_right(self.ppg_plot, self.ppg_wave_badge, x_margin=0.2, y_frac_from_top=0.03)
+            self._place_badge_top_right(self.eeg_plot, self.eeg_wave_badge, x_margin=0.2, y_frac_from_top=0.03)
+
+        elif self.view_mode == 'spectrogram':
+            # compute on the latest WINDOW_DURATION only
+            samples_to_show = int(WINDOW_DURATION * SAMPLING_RATE)
+            ppg_seg = np.array(self.ppg_buf)[-samples_to_show:]
+            eeg_seg = np.array(self.eeg_buf)[-samples_to_show:]
+
+            # PPG spectrogram
+            f1,t1,S1 = self.processor.compute_spectrogram(ppg_seg)
+            # use levels to control dynamic range; LUT gives reddish colors
+            self.ppg_img.setImage(S1.T, levels=(SPEC_DB_LOW, SPEC_DB_HIGH), lut=self.spec_lut, autoLevels=False)
+            self.ppg_img.setRect(QtCore.QRectF(0.0, 0.0, WINDOW_DURATION, SAMPLING_RATE/2.0))
+            self.ppg_specg.setXRange(0.0, WINDOW_DURATION, padding=0.0)
+            self.ppg_specg.setYRange(0.0, SAMPLING_RATE/2.0, padding=0.0)
+
+            # EEG spectrogram
+            f2,t2,S2 = self.processor.compute_spectrogram(eeg_seg)
+            self.eeg_img.setImage(S2.T, levels=(SPEC_DB_LOW, SPEC_DB_HIGH), lut=self.spec_lut, autoLevels=False)
+            self.eeg_img.setRect(QtCore.QRectF(0.0, 0.0, WINDOW_DURATION, SAMPLING_RATE/2.0))
+            self.eeg_specg.setXRange(0.0, WINDOW_DURATION, padding=0.0)
+            self.eeg_specg.setYRange(0.0, SAMPLING_RATE/2.0, padding=0.0)
+
+            # update spectrogram badges (top-right)
+            self.ppg_spec_badge.setHtml(self._badge_html(self.ppg_alert_active))
+            self.eeg_spec_badge.setHtml(self._badge_html(self.eeg_alert_active))
+            self._place_badge_top_right(self.ppg_specg, self.ppg_spec_badge, x_margin=0.2, y_frac_from_top=0.03)
+            self._place_badge_top_right(self.eeg_specg, self.eeg_spec_badge, x_margin=0.2, y_frac_from_top=0.03)
+
+    def closeEvent(self, e): self.stop_all(); e.accept()
+
+# ============================================================================
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyle('Fusion')
+    w = DualSignalVisualizationGUI()
+    w.show()
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
